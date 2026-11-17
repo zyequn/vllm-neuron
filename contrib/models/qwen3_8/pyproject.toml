@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77.0.3,<80.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-8-neuron"
+version = "0.1.0"
+description = "Qwen3.8-27B text decoder (Gated DeltaNet hybrid) for vLLM Neuron"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []
+
+# vLLM calls register() in every process (API server, engine, workers).
+[project.entry-points."vllm.general_plugins"]
+qwen3_8 = "qwen3_8_neuron:register"
+
+[tool.setuptools]
+package-dir = {"qwen3_8_neuron" = "src"}
+packages = ["qwen3_8_neuron"]
