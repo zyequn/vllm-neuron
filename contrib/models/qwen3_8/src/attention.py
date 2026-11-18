@@ -91,16 +91,23 @@ def read_paged_kv(
     return k_cache[block, :, pos, :], v_cache[block, :, pos, :]
 
 
+def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    return F.linear(x.to(dtype=layer.weight.dtype), layer.weight, layer.bias)
+
+
 def gated_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     gate: torch.Tensor,
     n_past: int,
+    query_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Causal attention. q is [H, S, D], k and v are [Hkv, T, D], T = n_past + S.
+    """Causal attention. q is [H, S, D], k and v are [Hkv, T, D].
 
-    gate is [S, H*D] and is applied after the heads are merged.
+    gate is [S, H*D] and is applied after the heads are merged. ``query_positions``
+    are absolute token positions. Without them, positions are ``n_past + 0..S-1``
+    and T is ``n_past + S``.
     """
     heads, seq, dim = q.shape
     kv_heads = k.shape[0]
@@ -112,8 +119,11 @@ def gated_attention(
         v = v.repeat_interleave(groups, dim=0)
     scale = dim ** -0.5
     scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
-    key_index = torch.arange(n_past + seq, device=q.device)
-    query_index = n_past + torch.arange(seq, device=q.device)
+    key_index = torch.arange(k.shape[1], device=q.device)
+    if query_positions is None:
+        query_index = n_past + torch.arange(seq, device=q.device)
+    else:
+        query_index = query_positions.to(device=q.device).reshape(seq)
     causal = key_index.unsqueeze(0) <= query_index.unsqueeze(1)
     scores = scores.masked_fill(~causal.unsqueeze(0), torch.finfo(torch.float32).min)
     probs = torch.softmax(scores, dim=-1)
@@ -166,13 +176,14 @@ class Qwen38Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """hidden [S, H] -> q [Hq, S, D], k, v [Hkv, S, D], gate [S, Hq*D]."""
         seq = hidden.shape[0]
-        qg = self.q_proj(hidden).view(seq, self.num_heads, self.head_dim * 2)
+        qg = _linear(self.q_proj, hidden).view(seq, self.num_heads, self.head_dim * 2)
         query, gate = qg.split(self.head_dim, dim=-1)
         query = self._norm(query, self.q_norm)
         key = self._norm(
-            self.k_proj(hidden).view(seq, self.num_kv_heads, self.head_dim), self.k_norm
+            _linear(self.k_proj, hidden).view(seq, self.num_kv_heads, self.head_dim),
+            self.k_norm,
         )
-        value = self.v_proj(hidden).view(seq, self.num_kv_heads, self.head_dim)
+        value = _linear(self.v_proj, hidden).view(seq, self.num_kv_heads, self.head_dim)
         q = query.transpose(0, 1)
         k = key.transpose(0, 1)
         v = value.transpose(0, 1)
@@ -188,18 +199,27 @@ class Qwen38Attention(nn.Module):
         slot_mapping: torch.Tensor,
         block_size: int,
         n_past: int,
+        query_positions: torch.Tensor | None = None,
+        n_read: int | None = None,
     ) -> torch.Tensor:
         """One request. hidden [S, H]. Caches are paged [blocks, Kv, block, D]."""
         q, k, v, gate = self.project(hidden)
         cos, sin = partial_rope_cos_sin(positions, self.rope_theta, self.rotary_dim)
         q, k = apply_partial_rope(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
         q, k = q.squeeze(0), k.squeeze(0)
+        q = q.to(dtype=v.dtype)
+        k = k.to(dtype=v.dtype)
         write_paged_kv(
             k.transpose(0, 1), v.transpose(0, 1), k_cache, v_cache, slot_mapping, block_size
         )
-        n_tokens = n_past + hidden.shape[0]
+        n_tokens = n_past + hidden.shape[0] if n_read is None else n_read
         k_all, v_all = read_paged_kv(k_cache, v_cache, block_table, n_tokens, block_size)
         out = gated_attention(
-            q, k_all.transpose(0, 1), v_all.transpose(0, 1), gate, n_past
+            q,
+            k_all.transpose(0, 1),
+            v_all.transpose(0, 1),
+            gate,
+            n_past,
+            query_positions=query_positions if query_positions is not None else positions,
         )
-        return self.o_proj(out)
+        return _linear(self.o_proj, out)

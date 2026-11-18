@@ -8863,6 +8863,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ):
             yield
 
+    def _align_delta_slot_owner(self, *, prefill: bool) -> None:
+        """Restore the slot owner the compiled Qwen3.8 graphs were traced with.
+
+        Prefill was traced while slot 0 was free. Decode was traced after that
+        prefill had stored key 0. A different owner is a Dynamo guard miss, and
+        torch.compile will not recompile.
+        """
+        seen: set[int] = set()
+        current = self.model
+        slots = None
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            found = getattr(current, "delta_slots", None)
+            if found is not None and hasattr(found, "owner"):
+                slots = found
+                break
+            current = getattr(current, "_orig_mod", None) or getattr(current, "_model", None)
+        if slots is None:
+            return
+        if prefill:
+            for i in range(len(slots.owner)):
+                slots.owner[i] = None
+            slots._index.clear()
+            return
+        if slots.owner and slots.owner[0] is None:
+            slots.owner[0] = 0
+            slots._index[0] = 0
+
     def _execute_model_forward(
         self,
         input_ids: torch.Tensor,
@@ -8954,6 +8982,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
 
             sampling_params_tensor = sampling_params_tensor.to(self.device)
+
+        if sampling_params_tensor is None:
+            # Warmup traces a [num_reqs, 3] tensor. None is a different
+            # specialization, and torch.compile will not recompile.
+            rows = 1
+            if attn_metadata:
+                rows = next(iter(attn_metadata.values()))["block_table_tensor"].shape[0]
+            sampling_params_tensor = torch.tensor(
+                [[0, 1.0, 1.0]] * int(rows),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         # Execute model on Neuron device (compiled with vllm_neuron backend)
         model_kwargs = {
@@ -9063,6 +9103,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and _first_am["max_query_len"] == 1
             and spec_decode_metadata is None
         )
+        self._align_delta_slot_owner(prefill=not is_plain_decode)
         with self._snapshot_capture_context(positions, spec_decode_metadata):
             with model_forward_context(self.vllm_config):
                 if is_plain_decode:

@@ -158,6 +158,10 @@ class GatedRMSNorm(nn.Module):
         return y.to(dtype)
 
 
+def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    return F.linear(x.to(dtype=layer.weight.dtype), layer.weight, layer.bias)
+
+
 class Qwen38GatedDeltaNet(nn.Module):
     """One Qwen3.5 linear-attention layer, without the HF Cache object.
 
@@ -211,10 +215,10 @@ class Qwen38GatedDeltaNet(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """hidden_states is [B, S, H]. Returns (out, new_conv_state, new_recurrent_state)."""
         batch, seq_len, _ = hidden_states.shape
-        projected = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).view(batch, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        projected = _linear(self.in_proj_qkv, hidden_states).transpose(1, 2)
+        z = _linear(self.in_proj_z, hidden_states).view(batch, seq_len, -1, self.head_v_dim)
+        b = _linear(self.in_proj_b, hidden_states)
+        a = _linear(self.in_proj_a, hidden_states)
         weight = self.conv1d.weight.squeeze(1)
         tail = self.conv_kernel_size - 1
 
@@ -261,4 +265,4 @@ class Qwen38GatedDeltaNet(nn.Module):
         )
         core = self.norm(core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
         core = core.view(batch, seq_len, -1)
-        return self.out_proj(core), new_conv, new_state
+        return _linear(self.out_proj, core), new_conv, new_state

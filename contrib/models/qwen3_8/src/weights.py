@@ -17,6 +17,31 @@ import torch
 from .config import Qwen38TextConfig
 
 
+def resolve_checkpoint(path: str | os.PathLike, cache_dir: str | None) -> Path:
+    """Return a local checkpoint directory. A repo id is downloaded first."""
+    root = Path(path)
+    if root.is_dir() or root.is_file():
+        return root
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo_id=str(path), cache_dir=cache_dir))
+
+
+def checkpoint_dtype(path: str | os.PathLike) -> torch.dtype:
+    """Dtype of the first tensor in the checkpoint, without reading every shard."""
+    file = _checkpoint_files(path)[0]
+    if file.suffix == ".safetensors":
+        from safetensors import safe_open
+
+        with safe_open(str(file), framework="pt") as handle:
+            view = handle.get_slice(next(iter(handle.keys())))
+            dtype = getattr(view, "dtype", None)
+            if dtype is not None:
+                return dtype
+    blob = torch.load(file, map_location="cpu", weights_only=True)
+    return next(iter(blob.values())).dtype
+
+
 def _checkpoint_files(path: str | os.PathLike) -> list[Path]:
     root = Path(path)
     if root.is_file():
@@ -42,7 +67,12 @@ def _read_tensors(path: str | os.PathLike) -> dict[str, torch.Tensor]:
 
 
 def _strip(key: str) -> str | None:
-    if key.startswith("visual.") or key.startswith("model.visual.") or ".mtp." in key:
+    if (
+        key.startswith("visual.")
+        or key.startswith("model.visual.")
+        or key.startswith("mtp.")
+        or ".mtp." in key
+    ):
         return None
     for prefix in ("model.language_model.", "model."):
         if key.startswith(prefix):
@@ -98,89 +128,106 @@ def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor) -> None:
         param.copy_(tensor.to(dtype=param.dtype))
 
 
-def load_text_weights(model, path: str | os.PathLike) -> list[str]:
-    """Copy text weights into ``model``. Returns the parameter names that were set."""
+def _iter_tensors(path: str | os.PathLike):
+    """Yield checkpoint tensors one at a time so a 27B load does not keep every shard."""
+    for file in _checkpoint_files(path):
+        if file.suffix == ".safetensors":
+            from safetensors import safe_open
+
+            with safe_open(str(file), framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    yield key, handle.get_tensor(key)
+        else:
+            blob = torch.load(file, map_location="cpu", weights_only=True)
+            yield from blob.items()
+
+
+def _place(model, key: str, tensor: torch.Tensor) -> str | None:
+    """Shard one text tensor into ``model``. Returns the parameter name, or None to skip."""
     config: Qwen38TextConfig = model.config
     rank, world = model.tp_rank, model.tp_size
-    raw = _read_tensors(path)
-    wanted: dict[str, torch.Tensor] = {}
-    for key, tensor in raw.items():
-        stripped = _strip(key)
-        if stripped is None or stripped.startswith("visual"):
-            continue
-        wanted[stripped] = tensor
-
-    loaded: list[str] = []
-
-    def take(src: str, dest: str, tensor: torch.Tensor) -> None:
-        _assign(model, dest, tensor)
-        loaded.append(dest)
-
-    if "embed_tokens.weight" not in wanted or "lm_head.weight" not in wanted:
-        raise KeyError("checkpoint is missing embed_tokens.weight or lm_head.weight")
-    take("embed_tokens.weight", "embed_tokens.weight", wanted["embed_tokens.weight"])
-    take("lm_head.weight", "lm_head.weight", wanted["lm_head.weight"])
-    take("norm.weight", "norm.weight", wanted["norm.weight"])
-
+    if key in ("embed_tokens.weight", "lm_head.weight", "norm.weight"):
+        _assign(model, key, tensor)
+        return key
+    parts = key.split(".")
+    if len(parts) < 4 or parts[0] != "layers":
+        return None
+    layer = int(parts[1])
+    kind = parts[2]
+    name = ".".join(parts[3:])
     num_k = config.linear_num_key_heads
     num_v = config.linear_num_value_heads
     head_k = config.linear_key_head_dim
     head_v = config.linear_value_head_dim
-    heads = config.num_attention_heads
-    kv = config.num_key_value_heads
-    head = config.head_dim
-
-    for layer in model.layers:
-        i = layer.layer_idx
-        prefix = f"layers.{i}."
-        take(prefix + "input_layernorm.weight", f"layers.{i}.input_layernorm.weight", wanted[prefix + "input_layernorm.weight"])
-        take(
-            prefix + "post_attention_layernorm.weight",
-            f"layers.{i}.post_attention_layernorm.weight",
-            wanted[prefix + "post_attention_layernorm.weight"],
-        )
-        gate = wanted[prefix + "mlp.gate_proj.weight"]
-        up = wanted[prefix + "mlp.up_proj.weight"]
-        down = wanted[prefix + "mlp.down_proj.weight"]
-        take(prefix + "mlp.gate_proj.weight", f"layers.{i}.mlp.gate_proj.weight", _shard(gate, rank, world, gate.shape[0]))
-        take(prefix + "mlp.up_proj.weight", f"layers.{i}.mlp.up_proj.weight", _shard(up, rank, world, up.shape[0]))
-        inter = down.shape[1]
-        local = inter // world
-        take(
-            prefix + "mlp.down_proj.weight",
-            f"layers.{i}.mlp.down_proj.weight",
-            down[:, rank * local : (rank + 1) * local],
-        )
-        if layer.is_linear:
-            src = prefix + "linear_attn."
-            dest = f"layers.{i}.mixer."
-            take(src + "in_proj_qkv.weight", dest + "in_proj_qkv.weight", _shard_qkv(wanted[src + "in_proj_qkv.weight"], rank, world, num_k, num_v, head_k, head_v))
-            z = wanted[src + "in_proj_z.weight"]
-            take(src + "in_proj_z.weight", dest + "in_proj_z.weight", _shard(z.reshape(num_v, head_v, -1), rank, world, num_v).reshape(-1, z.shape[-1]))
-            take(src + "in_proj_a.weight", dest + "in_proj_a.weight", _shard(wanted[src + "in_proj_a.weight"], rank, world, num_v))
-            take(src + "in_proj_b.weight", dest + "in_proj_b.weight", _shard(wanted[src + "in_proj_b.weight"], rank, world, num_v))
-            take(src + "conv1d.weight", dest + "conv1d.weight", _shard_qkv(wanted[src + "conv1d.weight"], rank, world, num_k, num_v, head_k, head_v))
-            take(src + "A_log", dest + "A_log", _shard(wanted[src + "A_log"], rank, world, num_v))
-            take(src + "dt_bias", dest + "dt_bias", _shard(wanted[src + "dt_bias"], rank, world, num_v))
-            take(src + "norm.weight", dest + "norm.weight", wanted[src + "norm.weight"])
-            take(src + "out_proj.weight", dest + "out_proj.weight", _shard_out(wanted[src + "out_proj.weight"], rank, world, num_v, head_v))
+    if kind in ("input_layernorm", "post_attention_layernorm") and name == "weight":
+        dest = f"layers.{layer}.{kind}.weight"
+        _assign(model, dest, tensor)
+        return dest
+    if kind == "mlp":
+        dest = f"layers.{layer}.mlp.{name}"
+        if name in ("gate_proj.weight", "up_proj.weight"):
+            tensor = _shard(tensor, rank, world, tensor.shape[0])
+        elif name == "down_proj.weight":
+            local = tensor.shape[1] // world
+            tensor = tensor[:, rank * local : (rank + 1) * local]
         else:
-            src = prefix + "self_attn."
-            dest = f"layers.{i}.attn."
-            q = wanted[src + "q_proj.weight"]
-            q = q.reshape(heads, 2 * head, -1)
-            q = _shard(q, rank, world, heads).reshape(-1, q.shape[-1])
-            take(src + "q_proj.weight", dest + "q_proj.weight", q)
-            k = wanted[src + "k_proj.weight"].reshape(kv, head, -1)
-            v = wanted[src + "v_proj.weight"].reshape(kv, head, -1)
-            take(src + "k_proj.weight", dest + "k_proj.weight", _shard(k, rank, world, kv).reshape(-1, k.shape[-1]))
-            take(src + "v_proj.weight", dest + "v_proj.weight", _shard(v, rank, world, kv).reshape(-1, v.shape[-1]))
-            o = wanted[src + "o_proj.weight"]
-            o = o.reshape(o.shape[0], heads, head)
-            o = _shard(o.transpose(0, 1), rank, world, heads).transpose(0, 1).reshape(o.shape[0], -1)
-            take(src + "o_proj.weight", dest + "o_proj.weight", o)
-            take(src + "q_norm.weight", dest + "q_norm", wanted[src + "q_norm.weight"])
-            take(src + "k_norm.weight", dest + "k_norm", wanted[src + "k_norm.weight"])
+            return None
+        _assign(model, dest, tensor)
+        return dest
+    if kind == "linear_attn":
+        dest = f"layers.{layer}.mixer.{name}"
+        if name in ("in_proj_qkv.weight", "conv1d.weight"):
+            tensor = _shard_qkv(tensor, rank, world, num_k, num_v, head_k, head_v)
+        elif name == "in_proj_z.weight":
+            tensor = _shard(tensor.reshape(num_v, head_v, -1), rank, world, num_v).reshape(-1, tensor.shape[-1])
+        elif name in ("in_proj_a.weight", "in_proj_b.weight", "A_log", "dt_bias"):
+            tensor = _shard(tensor, rank, world, num_v)
+        elif name == "out_proj.weight":
+            tensor = _shard_out(tensor, rank, world, num_v, head_v)
+        elif name != "norm.weight":
+            return None
+        _assign(model, dest, tensor)
+        return dest
+    if kind == "self_attn":
+        heads = config.num_attention_heads
+        kv = config.num_key_value_heads
+        head = config.head_dim
+        if name == "q_proj.weight":
+            tensor = _shard(tensor.reshape(heads, 2 * head, -1), rank, world, heads).reshape(-1, tensor.shape[-1])
+            dest = f"layers.{layer}.attn.q_proj.weight"
+        elif name == "k_proj.weight":
+            tensor = _shard(tensor.reshape(kv, head, -1), rank, world, kv).reshape(-1, tensor.shape[-1])
+            dest = f"layers.{layer}.attn.k_proj.weight"
+        elif name == "v_proj.weight":
+            tensor = _shard(tensor.reshape(kv, head, -1), rank, world, kv).reshape(-1, tensor.shape[-1])
+            dest = f"layers.{layer}.attn.v_proj.weight"
+        elif name == "o_proj.weight":
+            hidden = tensor.shape[0]
+            tensor = _shard(tensor.reshape(hidden, heads, head).transpose(0, 1), rank, world, heads)
+            tensor = tensor.transpose(0, 1).reshape(hidden, -1)
+            dest = f"layers.{layer}.attn.o_proj.weight"
+        elif name == "q_norm.weight":
+            dest = f"layers.{layer}.attn.q_norm"
+        elif name == "k_norm.weight":
+            dest = f"layers.{layer}.attn.k_norm"
+        else:
+            return None
+        _assign(model, dest, tensor)
+        return dest
+    return None
+
+
+def load_text_weights(model, path: str | os.PathLike) -> list[str]:
+    """Copy text weights into ``model``. Returns the parameter names that were set."""
+    loaded: list[str] = []
+    for key, tensor in _iter_tensors(path):
+        stripped = _strip(key)
+        if stripped is None or stripped.startswith("visual"):
+            continue
+        dest = _place(model, stripped, tensor)
+        del tensor
+        if dest is not None:
+            loaded.append(dest)
     missing = [name for name, _ in model.named_parameters() if name not in loaded]
     if missing:
         raise KeyError("checkpoint did not fill: " + ", ".join(missing))

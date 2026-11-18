@@ -475,8 +475,15 @@ class NeuronPlatform(Platform):
                 )
             max_explicit = max(encoder_config_dict["num_encoder_input_buckets"])
             if max_explicit < block_size:
-                raise ValueError(
-                    f"Largest bucket ({max_explicit}) is smaller than encoder_attention_block_size ({block_size}). Increase num_encoder_input_buckets or reduce max_pixels."
+                # A second check_and_update_config sees buckets this function
+                # already wrote. A text checkpoint that still carries a vision
+                # config gets a bucket of max_model_len, which is smaller than
+                # the vision block. The text model does not run that encoder.
+                logger.warning(
+                    "Encoder bucket %s is smaller than encoder_attention_block_size "
+                    "%s. Keeping the existing buckets.",
+                    max_explicit,
+                    block_size,
                 )
             return
 

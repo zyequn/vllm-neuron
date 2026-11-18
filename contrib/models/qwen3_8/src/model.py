@@ -24,6 +24,37 @@ from .slots import DeltaSlotTable
 from .weights import load_text_weights
 
 
+def _active_tp() -> tuple[int, int]:
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        group = get_tp_group()
+    except Exception:
+        return 1, 0
+    return int(group.world_size), int(group.rank_in_group)
+
+
+def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """Match the activation to the weight. BF16 checkpoints meet FP32 math."""
+    return F.linear(x.to(dtype=layer.weight.dtype), layer.weight, layer.bias)
+
+
+def reduce_replicas(hidden: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Sum a row-parallel shard across the tensor-parallel group.
+
+    With one rank, or before the group exists, the tensor is already complete.
+    """
+    if tp_size <= 1:
+        return hidden
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        group = get_tp_group()
+    except Exception:
+        return hidden
+    if group.world_size == 1:
+        return hidden
+    return group.all_reduce(hidden)
+
+
 def _first_block_id(block_row: torch.Tensor) -> int:
     for value in block_row.tolist():
         block = int(value)
@@ -44,7 +75,9 @@ class Qwen38MLP(nn.Module):
         self.tp_rank = tp_rank
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate = F.silu(_linear(self.gate_proj, x))
+        up = _linear(self.up_proj, x)
+        return _linear(self.down_proj, gate * up)
 
 
 class Qwen38DecoderLayer(nn.Module):
@@ -85,6 +118,7 @@ class Qwen38DecoderLayer(nn.Module):
         self.mlp = Qwen38MLP(
             config.hidden_size, config.intermediate_size, tp_size, tp_rank
         )
+        self.tp_size = tp_size
 
     def forward_linear(
         self,
@@ -96,17 +130,46 @@ class Qwen38DecoderLayer(nn.Module):
         mixed, new_conv, new_state = self.mixer(
             normed.unsqueeze(0), conv_state, recurrent_state
         )
-        hidden = hidden + mixed.squeeze(0)
-        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+        mixed = reduce_replicas(mixed.squeeze(0), self.tp_size).to(dtype=hidden.dtype)
+        hidden = hidden + mixed
+        mlp_out = reduce_replicas(
+            self.mlp(self.post_attention_layernorm(hidden)), self.tp_size
+        ).to(dtype=hidden.dtype)
+        hidden = hidden + mlp_out
         return hidden, new_conv, new_state
 
-    def forward_attn(self, hidden, positions, k_cache, v_cache, block_table, slots, block_size, n_past):
+    def forward_attn(
+        self,
+        hidden,
+        positions,
+        k_cache,
+        v_cache,
+        block_table,
+        slots,
+        block_size,
+        n_past,
+        query_positions=None,
+        n_read=None,
+    ):
         normed = self.input_layernorm(hidden)
         mixed = self.attn.forward_span(
-            normed, positions, k_cache, v_cache, block_table, slots, block_size, n_past
+            normed,
+            positions,
+            k_cache,
+            v_cache,
+            block_table,
+            slots,
+            block_size,
+            n_past,
+            query_positions=query_positions,
+            n_read=n_read,
         )
+        mixed = reduce_replicas(mixed, self.tp_size).to(dtype=hidden.dtype)
         hidden = hidden + mixed
-        hidden = hidden + self.mlp(self.post_attention_layernorm(hidden))
+        mlp_out = reduce_replicas(
+            self.mlp(self.post_attention_layernorm(hidden)), self.tp_size
+        ).to(dtype=hidden.dtype)
+        hidden = hidden + mlp_out
         return hidden
 
 
@@ -173,16 +236,34 @@ class Qwen38ForCausalLM(nn.Module):
         seqs = max_num_seqs
         if neuron_config is not None and getattr(neuron_config, "max_num_seqs", None):
             seqs = int(neuron_config.max_num_seqs)
+        if tp_size == 1 and tp_rank == 0:
+            world, rank = _active_tp()
+            tp_size, tp_rank = world, rank
         return cls(config, max_num_seqs=seqs, tp_size=tp_size, tp_rank=tp_rank)
+
+    @staticmethod
+    def _materialize(tensor: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """A meta tensor has no storage, so moving it has to allocate new zeros."""
+        if tensor.device.type == "meta":
+            return torch.zeros(tensor.shape, dtype=dtype, device=device)
+        return tensor.to(device=device, dtype=dtype)
 
     def to(self, *args, **kwargs):
         module = super().to(*args, **kwargs)
         device = next(self.parameters()).device
-        self.delta_slots.conv = self.delta_slots.conv.to(device=device)
-        self.delta_slots.recurrent = self.delta_slots.recurrent.to(device=device, dtype=torch.float32)
+        self.delta_slots.conv = self._materialize(
+            self.delta_slots.conv, device, self.delta_slots.conv.dtype
+        )
+        self.delta_slots.recurrent = self._materialize(
+            self.delta_slots.recurrent, device, torch.float32
+        )
         if hasattr(self, "_private_kv"):
             self._private_kv = {
-                idx: (k.to(device), v.to(device)) for idx, (k, v) in self._private_kv.items()
+                idx: (
+                    self._materialize(k, device, k.dtype),
+                    self._materialize(v, device, v.dtype),
+                )
+                for idx, (k, v) in self._private_kv.items()
             }
         return module
 
@@ -204,9 +285,15 @@ class Qwen38ForCausalLM(nn.Module):
         self._kv = kv_caches
 
     def load_weights(self, checkpoint_path: str, device: torch.device, cache_dir: str | None) -> None:
-        """Runner entry. ``cache_dir`` is accepted because the Neuron worker passes it."""
-        del cache_dir
-        load_text_weights(self, checkpoint_path)
+        """Runner entry. A Hugging Face repo id is downloaded into ``cache_dir``."""
+        from .weights import checkpoint_dtype, resolve_checkpoint
+
+        path = resolve_checkpoint(checkpoint_path, cache_dir)
+        if checkpoint_dtype(path) == torch.bfloat16:
+            self.to(dtype=torch.bfloat16)
+        if next(self.parameters()).is_meta:
+            self.to_empty(device="cpu")
+        load_text_weights(self, path)
         self.to(device)
 
     def _groups(self, n_tokens: int, positions: torch.Tensor, attn_metadata, req_ids, context_len):
@@ -235,6 +322,17 @@ class Qwen38ForCausalLM(nn.Module):
         meta = self._layer_meta(attn_metadata)
         block_table = meta["block_table_tensor"]
         n_req = block_table.shape[0]
+        # The Neuron runner's warmup metadata carries python lengths. Use the
+        # row index as the slot so the trace does not read block ids back to
+        # the host. Block id 0 is a real page in that metadata.
+        if "max_query_len" in meta:
+            reset = meta["max_query_len"] > meta["decode_token_threshold"]
+            if n_tokens % n_req:
+                raise ValueError(f"cannot split {n_tokens} tokens across {n_req} requests")
+            width = n_tokens // n_req
+            return [
+                (i * width, (i + 1) * width, i, reset) for i in range(n_req)
+            ]
         if n_req == 1:
             key = _first_block_id(block_table[0])
             starts = context_len == n_tokens if context_len is not None else int(positions[0]) == 0
@@ -298,7 +396,7 @@ class Qwen38ForCausalLM(nn.Module):
                 )
             )
         hidden = torch.cat(outputs, dim=0)
-        logits = self.lm_head(self.norm(hidden))
+        logits = _linear(self.lm_head, self.norm(hidden))
         if sampling_positions is not None:
             logits = torch.index_select(logits, 0, sampling_positions)
         return logits
@@ -307,13 +405,23 @@ class Qwen38ForCausalLM(nn.Module):
         slot = self.delta_slots.ensure(key, reset=reset)
         if reset:
             self._zero_private_kv(slot)
-        if context_len is None:
+        meta = self._layer_meta(attn_metadata) if attn_metadata else None
+        query_positions = None
+        n_read = None
+        if meta is not None and "max_query_len" in meta:
+            n_past = 0
+            query_positions = positions
+            if meta["max_query_len"] > meta["decode_token_threshold"]:
+                n_read = positions.shape[0]
+            else:
+                n_read = meta["block_table_tensor"].shape[-1] * int(meta["block_size"])
+            n_total = n_read
+        elif context_len is None:
             n_past = int(positions[0])
             n_total = int(positions[-1]) + 1
         else:
             n_total = int(context_len)
             n_past = n_total - positions.shape[0]
-        meta = self._layer_meta(attn_metadata) if attn_metadata else None
         for layer in self.layers:
             if layer.is_linear:
                 index = self._linear_index[layer.layer_idx]
@@ -330,7 +438,16 @@ class Qwen38ForCausalLM(nn.Module):
                     layer, meta, key, positions, n_total
                 )
                 hidden = layer.forward_attn(
-                    hidden, positions, k_cache, v_cache, block_table, slots, block_size, n_past
+                    hidden,
+                    positions,
+                    k_cache,
+                    v_cache,
+                    block_table,
+                    slots,
+                    block_size,
+                    n_past,
+                    query_positions=query_positions,
+                    n_read=n_read,
                 )
         return hidden
 
@@ -338,11 +455,14 @@ class Qwen38ForCausalLM(nn.Module):
         name = f"layers.{layer.layer_idx}.self_attn"
         if meta is not None and hasattr(self, "_kv") and name in self._kv:
             block_table = meta["block_table_tensor"]
-            row = 0
-            for i in range(block_table.shape[0]):
-                if _first_block_id(block_table[i]) == key:
-                    row = i
-                    break
+            if "max_query_len" in meta:
+                row = key
+            else:
+                row = 0
+                for i in range(block_table.shape[0]):
+                    if _first_block_id(block_table[i]) == key:
+                        row = i
+                        break
             n = positions.shape[0]
             slot_mapping = meta["slot_mapping"]
             if slot_mapping.shape[0] == block_table.shape[0]:

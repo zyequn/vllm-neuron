@@ -170,6 +170,26 @@ def test_runner_metadata_uses_block_id_and_releases_finished_requests():
     assert 4 in model.delta_slots._index
 
 
+def test_layer_reduces_both_shards_before_the_residual():
+    import qwen3_8_neuron.model as model_mod
+
+    model = Qwen38ForCausalLM(Qwen38TextConfig.from_configs(_tiny_config()), tp_size=2, tp_rank=0)
+    seen = []
+    original = model_mod.reduce_replicas
+
+    def _mark(hidden, tp_size):
+        seen.append(tp_size)
+        return hidden
+
+    model_mod.reduce_replicas = _mark
+    try:
+        with torch.no_grad():
+            model.layers[0].forward_linear(torch.randn(2, 32), None, None)
+    finally:
+        model_mod.reduce_replicas = original
+    assert seen == [2, 2]
+
+
 def test_value_head_shard_sums_to_full_delta():
     torch.manual_seed(4)
     full = Qwen38GatedDeltaNet(32, 2, 4, 8, 8, 4).eval()

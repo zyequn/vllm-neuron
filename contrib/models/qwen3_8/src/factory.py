@@ -32,11 +32,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if hf_config is None and vllm_config is not None:
-            hf_config = vllm_config.model_config.hf_config
-        self._model = (
-            self.from_configs(hf_config, neuron_config) if hf_config is not None else None
-        )
+        # The worker builds the text stack with from_configs. Building it here
+        # would allocate the 27B parameters in the API process.
+        del hf_config, neuron_config, vllm_config, prefix
+        self._model = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("vllm-neuron embeds inside the compiled forward")
