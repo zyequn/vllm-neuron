@@ -65,23 +65,58 @@ def recurrent_gated_delta_rule(
         )
     else:
         state = initial_state.to(dtype=value.dtype)
-    out = torch.zeros_like(value)
 
-    for i in range(seq_len):
-        q_t = query[:, :, i]
-        k_t = key[:, :, i]
-        v_t = value[:, :, i]
-        state = state * decay[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
-        beta_t = beta[:, :, i].unsqueeze(-1)
-        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta_t
-        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+    if query.device.type not in ("cpu", "meta") and k_dim == 128 and v_dim == 128:
+        out, state = _recurrence_on_neuron(query, key, value, decay, beta, state)
+    else:
+        out = torch.zeros_like(value)
+        for i in range(seq_len):
+            q_t = query[:, :, i]
+            k_t = key[:, :, i]
+            v_t = value[:, :, i]
+            state = state * decay[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+            beta_t = beta[:, :, i].unsqueeze(-1)
+            kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+            delta = (v_t - kv_mem) * beta_t
+            state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+            out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
     out = out.transpose(1, 2).contiguous().to(initial_dtype)
     if not output_final_state:
         return out, None
     return out, state
+
+
+def _recurrence_on_neuron(query, key, value, decay, beta, state):
+    """Run the token loop as one NKI call per batch row.
+
+    ``query`` and ``key`` are ``[B, heads, S, K]``. ``value`` is
+    ``[B, heads, S, V]``. ``decay`` is log-space ``g``. ``state`` is
+    ``[B, heads, K, V]``. The returned ``out`` matches ``value``'s layout.
+    """
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    from .gated_delta_nki import gated_delta_recurrence
+
+    kernel = wrap_nki(gated_delta_recurrence)
+    batch, _heads, seq, _k_dim = query.shape
+    decay = decay.exp()
+    outs = []
+    states = []
+    for row in range(batch):
+        length = torch.tensor([[seq]], dtype=torch.int32, device=query.device)
+        out_row, state_row = kernel(
+            query[row].transpose(1, 2).contiguous(),
+            key[row].transpose(1, 2).contiguous(),
+            value[row].transpose(1, 2).contiguous(),
+            decay[row].contiguous(),
+            beta[row].contiguous(),
+            state[row].contiguous(),
+            length,
+        )
+        outs.append(out_row.transpose(1, 2))
+        states.append(state_row)
+    return torch.stack(outs, dim=0), torch.stack(states, dim=0)
 
 
 def causal_conv1d(
