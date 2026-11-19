@@ -2074,6 +2074,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # inlines kernel BIR into the parent graph, birverifier rejects the
             # resulting multiple back-edges without this flag.
             "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
+            # 512MB scratchpad pages round each live region up and push the
+            # 1536-token prefill over the 24GB logical-core limit. 64MB pages
+            # must match NEURON_SCRATCHPAD_PAGE_SIZE at runtime.
+            "--hbm-scratchpad-page-size=64",
         ]
         if native_gk_decode:
             self.compile_options["compiler_args"].append("--model-type=generic")

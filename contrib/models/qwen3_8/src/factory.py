@@ -65,9 +65,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     @classmethod
     def _validate_config(cls, hf_config, neuron_config: NeuronConfig | None) -> None:
         quantization = getattr(neuron_config, "quantization", None) if neuron_config else None
-        if quantization not in (None, "bf16"):
+        if quantization not in (None, "bf16", "fp8"):
             raise ValueError(
-                f"Qwen3.8 contrib model supports BF16 only, got quantization={quantization!r}"
+                f"Qwen3.8 contrib model supports bf16 and static fp8, got quantization={quantization!r}"
             )
         archs = list(getattr(hf_config, "architectures", None) or [])
         if isinstance(hf_config, dict):

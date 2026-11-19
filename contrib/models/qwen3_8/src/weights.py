@@ -120,10 +120,15 @@ def _shard_out(weight: torch.Tensor, rank: int, world: int, num_v: int, head_v: 
     return value.reshape(hidden, -1)
 
 
-def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor) -> None:
+def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor, *, static_fp8: bool) -> None:
     param = module.get_parameter(name)
     if param.shape != tensor.shape:
         raise ValueError(f"{name}: checkpoint {tuple(tensor.shape)} != parameter {tuple(param.shape)}")
+    if static_fp8 and tensor.ndim == 2 and name.endswith(".weight"):
+        from .static_fp8 import install_quantized_weight
+
+        install_quantized_weight(module, name, tensor)
+        return
     with torch.no_grad():
         param.copy_(tensor.to(dtype=param.dtype))
 
@@ -146,8 +151,9 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
     """Shard one text tensor into ``model``. Returns the parameter name, or None to skip."""
     config: Qwen38TextConfig = model.config
     rank, world = model.tp_rank, model.tp_size
+    static_fp8 = bool(getattr(model, "static_fp8", False))
     if key in ("embed_tokens.weight", "lm_head.weight", "norm.weight"):
-        _assign(model, key, tensor)
+        _assign(model, key, tensor, static_fp8=static_fp8)
         return key
     parts = key.split(".")
     if len(parts) < 4 or parts[0] != "layers":
@@ -161,7 +167,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
     head_v = config.linear_value_head_dim
     if kind in ("input_layernorm", "post_attention_layernorm") and name == "weight":
         dest = f"layers.{layer}.{kind}.weight"
-        _assign(model, dest, tensor)
+        _assign(model, dest, tensor, static_fp8=static_fp8)
         return dest
     if kind == "mlp":
         dest = f"layers.{layer}.mlp.{name}"
@@ -172,7 +178,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
             tensor = tensor[:, rank * local : (rank + 1) * local]
         else:
             return None
-        _assign(model, dest, tensor)
+        _assign(model, dest, tensor, static_fp8=static_fp8)
         return dest
     if kind == "linear_attn":
         dest = f"layers.{layer}.mixer.{name}"
@@ -186,7 +192,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
             tensor = _shard_out(tensor, rank, world, num_v, head_v)
         elif name != "norm.weight":
             return None
-        _assign(model, dest, tensor)
+        _assign(model, dest, tensor, static_fp8=static_fp8)
         return dest
     if kind == "self_attn":
         heads = config.num_attention_heads
@@ -212,7 +218,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
             dest = f"layers.{layer}.attn.k_norm"
         else:
             return None
-        _assign(model, dest, tensor)
+        _assign(model, dest, tensor, static_fp8=static_fp8)
         return dest
     return None
 

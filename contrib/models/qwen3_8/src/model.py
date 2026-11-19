@@ -34,8 +34,10 @@ def _active_tp() -> tuple[int, int]:
 
 
 def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    """Match the activation to the weight. BF16 checkpoints meet FP32 math."""
-    return F.linear(x.to(dtype=layer.weight.dtype), layer.weight, layer.bias)
+    """BF16 projections use ``F.linear``. Static FP8 keeps the weight bytes."""
+    from .static_fp8 import linear
+
+    return linear(layer, x)
 
 
 def reduce_replicas(hidden: torch.Tensor, tp_size: int) -> torch.Tensor:
@@ -222,6 +224,8 @@ class Qwen38ForCausalLM(nn.Module):
         ]
         self.block_size = 16
         self._blocks_per_seq = 32
+        quant = getattr(config.neuron_config, "quantization", None)
+        self.static_fp8 = quant == "fp8"
 
     @classmethod
     def from_configs(
@@ -382,7 +386,9 @@ class Qwen38ForCausalLM(nn.Module):
             input_ids.shape[0], positions, attn_metadata, req_ids, context_len
         )
         self.delta_slots.retain_only({key for _, _, key, _ in groups})
-        hidden = self.embed_tokens(input_ids)
+        from .static_fp8 import embed
+
+        hidden = embed(self.embed_tokens, input_ids)
         outputs = []
         for start, end, key, reset in groups:
             outputs.append(

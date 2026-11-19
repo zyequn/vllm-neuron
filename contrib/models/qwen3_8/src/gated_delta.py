@@ -194,7 +194,9 @@ class GatedRMSNorm(nn.Module):
 
 
 def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    return F.linear(x.to(dtype=layer.weight.dtype), layer.weight, layer.bias)
+    from .static_fp8 import linear
+
+    return linear(layer, x)
 
 
 class Qwen38GatedDeltaNet(nn.Module):
