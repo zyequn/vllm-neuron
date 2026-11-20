@@ -669,7 +669,13 @@ class NeuronModelRunnerV2:
 
             self._spmd_rank_tensors = stamp_spmd_rank_tensors(self.device)
 
-            hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+            _flag_model = getattr(self.model, "_orig_mod", self.model)
+            if getattr(_flag_model, "skip_modular_mac_threshold", False):
+                # See NeuronModelRunner: the default 2e11 target still splits
+                # this graph. A threshold above its MAC count keeps one module.
+                hlo2_parts: list[str] = ["--modular-flow-mac-threshold=1000000000000000000"]
+            else:
+                hlo2_parts = ["--modular-flow-mac-threshold=10"]
             from libtorch_neuronx_lite.compile.platform import get_platform_target
 
             has_fp8 = self.vllm_config.cache_config.cache_dtype in (
@@ -683,14 +689,20 @@ class NeuronModelRunnerV2:
             if not has_fp8:
                 has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
             if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
-                hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+                hlo2_parts.append("--experimental-unsafe-fp8e4m3fn-as-fp8e4m3")
+            hlo2tensorizer_opts = " ".join(hlo2_parts)
             self.compile_options["compiler_args"] = [
                 "--auto-cast=none",
                 "--verbose=35",
                 f"-O{self.vllm_config.optimization_level.value}",
-                f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
-                "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
             ]
+            if hlo2tensorizer_opts:
+                self.compile_options["compiler_args"].append(
+                    f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}"
+                )
+            self.compile_options["compiler_args"].append(
+                "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop"
+            )
             logger.info(
                 "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
                 self.vllm_config.optimization_level.value,

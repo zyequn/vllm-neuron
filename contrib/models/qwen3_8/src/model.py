@@ -21,6 +21,8 @@ from .attention import Qwen38Attention
 from .config import Qwen38TextConfig
 from .gated_delta import Qwen38GatedDeltaNet, ZeroCenteredRMSNorm
 from .slots import DeltaSlotTable
+from .static_fp8 import embed as _embed
+from .static_fp8 import linear as _linear
 from .weights import load_text_weights
 
 
@@ -31,13 +33,6 @@ def _active_tp() -> tuple[int, int]:
     except Exception:
         return 1, 0
     return int(group.world_size), int(group.rank_in_group)
-
-
-def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    """BF16 projections use ``F.linear``. Static FP8 keeps the weight bytes."""
-    from .static_fp8 import linear
-
-    return linear(layer, x)
 
 
 def reduce_replicas(hidden: torch.Tensor, tp_size: int) -> torch.Tensor:
@@ -176,9 +171,33 @@ class Qwen38DecoderLayer(nn.Module):
 
 
 class Qwen38ForCausalLM(nn.Module):
+    # Forty-eight Gated DeltaNet kernels share one graph. The runner's
+    # modular-flow MAC threshold splits each kernel into a subgraph, and the
+    # runtime then rejects the NEFF. Leave the threshold off for this model.
+    # Keep one module when many DeltaNet NKI calls share a graph. Set False
+    # (or QWEN38_SPLIT_MODULAR=1) to force modular-flow splits when debugging
+    # DataLocalityOpt / NRT load issues.
+    skip_modular_mac_threshold = True
     """Text-only model. Vision and MTP weights are not loaded."""
 
     prefix_caching = False
+
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Prefer -O2 on decode when the caller did not pin an opt level."""
+        del example_inputs
+        args = list(base or [])
+        if graph_type != "decode":
+            return args
+        replaced = False
+        for i, arg in enumerate(args):
+            if arg in ("-O1", "-O2", "-O3") or (
+                isinstance(arg, str) and arg.startswith("-O") and arg[2:].isdigit()
+            ):
+                args[i] = "-O2"
+                replaced = True
+        if not replaced:
+            args.append("-O2")
+        return args
 
     def __init__(
         self,
@@ -191,6 +210,15 @@ class Qwen38ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        import os
+
+        # QWEN38_SPLIT_MODULAR=1 forces modular-flow splits (threshold 10).
+        if os.environ.get("QWEN38_SPLIT_MODULAR", "").strip() in ("1", "true", "True"):
+            self.skip_modular_mac_threshold = False
+        neuron_config = getattr(config, "neuron_config", None)
+        # Static FP8 keeps each 2D projection as float8 plus a scale. The
+        # matmul widens one tile, so HBM holds one byte per weight.
+        self.quantize_fp8 = getattr(neuron_config, "quantization", None) == "fp8"
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
@@ -211,6 +239,16 @@ class Qwen38ForCausalLM(nn.Module):
             conv_dim=spec.conv_dim if spec else 1,
             conv_tail=(spec.conv_kernel_size - 1) if spec else 1,
         )
+        # Buffers, not plain attributes. A compiled graph mutates these in
+        # place, and the Neuron runtime can only alias that write onto a
+        # module buffer. A tensor hanging off a Python object is lowered as a
+        # constant and the execute call then dereferences a null tensor.
+        # ``_apply`` rebinds the slot table after every move: ``Module.to``
+        # replaces ``_buffers`` with new tensors and does not call ``to()``.
+        self.register_buffer("delta_conv", self.delta_slots.conv)
+        self.register_buffer("delta_recurrent", self.delta_slots.recurrent)
+        self.delta_slots.conv = self.delta_conv
+        self.delta_slots.recurrent = self.delta_recurrent
         self._linear_index = {}
         linear_row = 0
         for layer in self.layers:
@@ -224,8 +262,6 @@ class Qwen38ForCausalLM(nn.Module):
         ]
         self.block_size = 16
         self._blocks_per_seq = 32
-        quant = getattr(config.neuron_config, "quantization", None)
-        self.static_fp8 = quant == "fp8"
 
     @classmethod
     def from_configs(
@@ -252,15 +288,34 @@ class Qwen38ForCausalLM(nn.Module):
             return torch.zeros(tensor.shape, dtype=dtype, device=device)
         return tensor.to(device=device, dtype=dtype)
 
-    def to(self, *args, **kwargs):
-        module = super().to(*args, **kwargs)
+    def _apply(self, fn, recurse=True):
+        # ``Module.to`` / ``cpu`` / ``bfloat16`` call ``_apply`` on each child.
+        # That replaces every buffer with ``fn(buffer)`` and leaves
+        # ``delta_slots`` holding the pre-move tensors. A traced forward then
+        # mutates those stale tensors, and Neuron execute aborts on a null
+        # device pointer. Recurrent state stays fp32 across a dtype cast.
+        was_meta = next(self.parameters()).is_meta
+        module = super()._apply(fn, recurse)
         device = next(self.parameters()).device
-        self.delta_slots.conv = self._materialize(
-            self.delta_slots.conv, device, self.delta_slots.conv.dtype
-        )
-        self.delta_slots.recurrent = self._materialize(
-            self.delta_slots.recurrent, device, torch.float32
-        )
+        if was_meta:
+            self.delta_conv = torch.zeros(
+                self.delta_conv.shape, dtype=self.delta_conv.dtype, device=device
+            )
+            self.delta_recurrent = torch.zeros(
+                self.delta_recurrent.shape, dtype=torch.float32, device=device
+            )
+        else:
+            recurrent = self.delta_recurrent
+            if recurrent.dtype != torch.float32 or recurrent.device != device:
+                self.delta_recurrent = self._materialize(
+                    self.delta_recurrent, device, torch.float32
+                )
+            if self.delta_conv.device != device:
+                self.delta_conv = self._materialize(
+                    self.delta_conv, device, self.delta_conv.dtype
+                )
+        self.delta_slots.conv = self.delta_conv
+        self.delta_slots.recurrent = self.delta_recurrent
         if hasattr(self, "_private_kv"):
             self._private_kv = {
                 idx: (
@@ -386,9 +441,7 @@ class Qwen38ForCausalLM(nn.Module):
             input_ids.shape[0], positions, attn_metadata, req_ids, context_len
         )
         self.delta_slots.retain_only({key for _, _, key, _ in groups})
-        from .static_fp8 import embed
-
-        hidden = embed(self.embed_tokens, input_ids)
+        hidden = _embed(self.embed_tokens, input_ids)
         outputs = []
         for start, end, key, reset in groups:
             outputs.append(
@@ -431,14 +484,14 @@ class Qwen38ForCausalLM(nn.Module):
         for layer in self.layers:
             if layer.is_linear:
                 index = self._linear_index[layer.layer_idx]
-                conv = None if reset and n_past == 0 else self.delta_slots.conv[index, slot]
-                state = None if reset and n_past == 0 else self.delta_slots.recurrent[index, slot]
+                conv = None if reset and n_past == 0 else self.delta_conv[index, slot]
+                state = None if reset and n_past == 0 else self.delta_recurrent[index, slot]
                 if conv is not None:
                     conv = conv.unsqueeze(0)
                     state = state.unsqueeze(0)
                 hidden, new_conv, new_state = layer.forward_linear(hidden, conv, state)
-                self.delta_slots.conv[index, slot] = new_conv.squeeze(0)
-                self.delta_slots.recurrent[index, slot] = new_state.squeeze(0)
+                self.delta_conv[index, slot] = new_conv.squeeze(0)
+                self.delta_recurrent[index, slot] = new_state.squeeze(0)
             else:
                 k_cache, v_cache, block_table, slots, block_size = self._attn_view(
                     layer, meta, key, positions, n_total

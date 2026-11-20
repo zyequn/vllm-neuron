@@ -10,8 +10,9 @@ partial RoPE, then softmax attention scaled by ``1/sqrt(head_dim)``.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+
+from .static_fp8 import linear as _linear
 
 
 def partial_rope_cos_sin(
@@ -52,29 +53,6 @@ def apply_partial_rope(
     return _rotate(q), _rotate(k)
 
 
-def _page_shift(block_size: int) -> int:
-    """Bit shift for a power-of-two page."""
-    size = int(block_size)
-    if size <= 0 or size & (size - 1):
-        raise ValueError(f"block_size must be a power of two, got {block_size}")
-    return size.bit_length() - 1
-
-
-def _block_and_offset(index: torch.Tensor, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a slot into ``(block, offset)`` with a shift and a mask.
-
-    Floor division is an HLO ``select`` chain. DataLocalityOpt asserts on that
-    select in the fused decode graph. A power-of-two page is a shift and an
-    AND, and a negative padding slot stays on the page it already names so the
-    masked store can write the old value back.
-    """
-    shift = _page_shift(block_size)
-    bits = index.to(dtype=torch.int64)
-    block = torch.bitwise_right_shift(bits, shift)
-    pos = torch.bitwise_and(bits, (1 << shift) - 1)
-    return block, pos
-
-
 def write_paged_kv(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -89,21 +67,15 @@ def write_paged_kv(
     inside a traced graph.
     """
     slots = slot_mapping.to(dtype=torch.long)
-    block, pos = _block_and_offset(slots, block_size)
-    # The fused decode graph cannot compile a select used as a scatter update
-    # or as a signed-shift correction (MacroGeneration: "Expected Store as
-    # root"). On device the slot ids are non-negative; padding writes the null
-    # block. CPU keeps the masked store so a negative slot does not clobber.
-    if k.device.type in ("cpu", "meta"):
-        valid = slots >= 0
-        written_k = k_cache[block, :, pos, :]
-        written_v = v_cache[block, :, pos, :]
-        mask = valid.view(-1, 1, 1)
-        k_cache[block, :, pos, :] = torch.where(mask, k, written_k)
-        v_cache[block, :, pos, :] = torch.where(mask, v, written_v)
-        return
-    k_cache[block, :, pos, :] = k
-    v_cache[block, :, pos, :] = v
+    valid = slots >= 0
+    safe = torch.where(valid, slots, torch.zeros_like(slots))
+    block = torch.div(safe, block_size, rounding_mode="floor")
+    pos = torch.remainder(safe, block_size)
+    written_k = k_cache[block, :, pos, :]
+    written_v = v_cache[block, :, pos, :]
+    mask = valid.view(-1, 1, 1)
+    k_cache[block, :, pos, :] = torch.where(mask, k, written_k)
+    v_cache[block, :, pos, :] = torch.where(mask, v, written_v)
 
 
 def read_paged_kv(
@@ -115,15 +87,9 @@ def read_paged_kv(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Read the first n_tokens of one request. block_table is [n_blocks]."""
     index = torch.arange(n_tokens, device=k_cache.device)
-    block_id, pos = _block_and_offset(index, block_size)
-    block = block_table[block_id]
+    block = block_table[torch.div(index, block_size, rounding_mode="floor")]
+    pos = torch.remainder(index, block_size)
     return k_cache[block, :, pos, :], v_cache[block, :, pos, :]
-
-
-def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    from .static_fp8 import linear
-
-    return linear(layer, x)
 
 
 def gated_attention(

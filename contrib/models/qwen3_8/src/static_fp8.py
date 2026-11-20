@@ -21,6 +21,10 @@ _LEGACY_MAX = 240.0
 _WEIGHT_DOWNSCALE = _LEGACY_MAX / _OCP_MAX
 _SCALE_COMPENSATION = _OCP_MAX / _LEGACY_MAX
 _TILE = 128
+# One custom call covers this many output rows. The LM head is 248320 rows;
+# a single NKI launch would unroll that into one kernel. 1024 keeps every
+# launch inside a few hundred tensor-engine tiles and the weight slice stays FP8.
+_N_CHUNK = 1024
 
 
 def needs_trn2_downscale() -> bool:
@@ -91,7 +95,11 @@ def install_quantized_weight(module: nn.Module, name: str, tensor: torch.Tensor)
     for part in parts[:-1]:
         parent = getattr(parent, part)
     parent.register_parameter(parts[-1], nn.Parameter(quantized, requires_grad=False))
-    parent.register_buffer("weight_scale", scale.float().reshape(1, 1))
+    scale = scale.float().reshape(1, 1)
+    if "weight_scale" in parent._buffers:
+        parent._buffers["weight_scale"] = scale
+    else:
+        parent.register_buffer("weight_scale", scale)
 
 
 def is_fp8_weight(weight: torch.Tensor) -> bool:
@@ -157,31 +165,49 @@ def static_fp8_linear(
     out_dtype = x.dtype if x.dtype != _FP8 else torch.bfloat16
     if weight.device.type in ("cpu", "meta"):
         return reference_linear(x, weight, weight_scale, input_scale)
-    values = x if x.dtype != _FP8 else x.float()
+    values = x.float()
     if input_scale is not None:
         values = requantize_activation(values, input_scale)
-    # The resident weight stays FP8. Widening it is the matmul's weight
-    # operand, which is the same dot the bf16 model already compiles.
-    scale = weight_scale.detach().float().reshape(())
-    widened = (weight.float() * scale).to(dtype=values.dtype)
-    return F.linear(values, widened).to(dtype=out_dtype)
+    # The compiled graph must not contain weight.float(): that materializes a
+    # full BF16 copy of every matrix and blows the 24 GB Trn2 limit. The kernel
+    # widens one K-tile in SBUF.
+    return _linear_on_neuron(values, weight, weight_scale).to(dtype=out_dtype)
 
 
 def _linear_on_neuron(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> torch.Tensor:
-    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-
     flat = x.reshape(-1, x.shape[-1]).contiguous()
     if flat.shape[-1] % _TILE or weight.shape[-1] % _TILE:
         raise ValueError(
             f"static FP8 K must be a multiple of {_TILE}, got x {tuple(x.shape)} "
             f"weight {tuple(weight.shape)}"
         )
-    kernel = wrap_nki(static_fp8_gemm)
-    scale = weight_scale.detach().float().reshape(1, 1).contiguous()
-    produced = kernel(flat, weight.contiguous(), scale)
-    return produced.transpose(0, 1).reshape(*x.shape[:-1], weight.shape[0])
+    # DataLocalityOpt asserts on predicated partial tensor-engine tiles
+    # (NCC_IDLO901 on ``_select``). Always feed the kernel dense 128-aligned
+    # M and N. Build the pad with ``cat`` of zeros so the graph does not keep
+    # an ``aten.pad`` / rem-tile select next to the NKI call.
+    m_rows = flat.shape[0]
+    m_pad = (m_rows + _TILE - 1) // _TILE * _TILE
+    if m_pad != m_rows:
+        flat = torch.cat(
+            [flat, flat.new_zeros((m_pad - m_rows, flat.shape[1]))], dim=0
+        )
+    scale = weight_scale.float().reshape(1, 1).contiguous()
+    parts = []
+    n_rows = weight.shape[0]
+    for start in range(0, n_rows, _N_CHUNK):
+        rows = weight[start : start + _N_CHUNK].contiguous()
+        n_chunk = rows.shape[0]
+        n_pad = (n_chunk + _TILE - 1) // _TILE * _TILE
+        if n_pad != n_chunk:
+            rows = torch.cat(
+                [rows, rows.new_zeros((n_pad - n_chunk, rows.shape[1]))], dim=0
+            )
+        produced = _FP8_GEMM(flat, rows, scale)
+        parts.append(produced[:n_chunk, :m_rows].contiguous())
+    produced = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+    return produced.transpose(0, 1).reshape(*x.shape[:-1], n_rows)
 
 
 import nki
@@ -267,18 +293,26 @@ def static_fp8_gemm(x, weight, weight_scale):
             src=scaled,
         )
 
-    m_full, n_full = m_rows // tile, n_rows // tile
-    m_rem, n_rem = m_rows % tile, n_rows % tile
-    for n in range(n_full):
+    # Host padding guarantees M and N are multiples of 128. Remainder tiles
+    # used to live here and were the DataLocalityOpt select that failed at
+    # eight layers / decode.
+    if m_rows % tile or n_rows % tile:
+        raise Exception(
+            f"[NCC_INKI016] static_fp8_gemm needs M,N multiples of {tile}, "
+            f"got M={m_rows} N={n_rows}"
+        )
+    for n in range(n_rows // tile):
         n_off = n * tile
-        for m in range(m_full):
+        for m in range(m_rows // tile):
             _emit(n_off, tile, m * tile, tile)
-        if m_rem:
-            _emit(n_off, tile, m_full * tile, m_rem)
-    if n_rem:
-        n_off = n_full * tile
-        for m in range(m_full):
-            _emit(n_off, n_rem, m * tile, tile)
-        if m_rem:
-            _emit(n_off, n_rem, m_full * tile, m_rem)
     return out
+
+
+def _load_fp8_gemm():
+    """Register the kernel once, at import. Dynamo rejects setattr during trace."""
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+    return wrap_nki(static_fp8_gemm)
+
+
+_FP8_GEMM = _load_fp8_gemm()

@@ -120,11 +120,13 @@ def _shard_out(weight: torch.Tensor, rank: int, world: int, num_v: int, head_v: 
     return value.reshape(hidden, -1)
 
 
-def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor, *, static_fp8: bool) -> None:
+def _assign(module: torch.nn.Module, name: str, tensor: torch.Tensor) -> None:
     param = module.get_parameter(name)
     if param.shape != tensor.shape:
         raise ValueError(f"{name}: checkpoint {tuple(tensor.shape)} != parameter {tuple(param.shape)}")
-    if static_fp8 and tensor.ndim == 2 and name.endswith(".weight"):
+    # 2D projection and embedding matrices. Conv kernels stay BF16; the
+    # depthwise conv reads them directly and the FP8 kernel only covers linear.
+    if getattr(module, "quantize_fp8", False) and tensor.ndim == 2 and name.endswith("weight"):
         from .static_fp8 import install_quantized_weight
 
         install_quantized_weight(module, name, tensor)
@@ -151,14 +153,15 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
     """Shard one text tensor into ``model``. Returns the parameter name, or None to skip."""
     config: Qwen38TextConfig = model.config
     rank, world = model.tp_rank, model.tp_size
-    static_fp8 = bool(getattr(model, "static_fp8", False))
     if key in ("embed_tokens.weight", "lm_head.weight", "norm.weight"):
-        _assign(model, key, tensor, static_fp8=static_fp8)
+        _assign(model, key, tensor)
         return key
     parts = key.split(".")
     if len(parts) < 4 or parts[0] != "layers":
         return None
     layer = int(parts[1])
+    if layer >= config.num_hidden_layers:
+        return None
     kind = parts[2]
     name = ".".join(parts[3:])
     num_k = config.linear_num_key_heads
@@ -167,7 +170,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
     head_v = config.linear_value_head_dim
     if kind in ("input_layernorm", "post_attention_layernorm") and name == "weight":
         dest = f"layers.{layer}.{kind}.weight"
-        _assign(model, dest, tensor, static_fp8=static_fp8)
+        _assign(model, dest, tensor)
         return dest
     if kind == "mlp":
         dest = f"layers.{layer}.mlp.{name}"
@@ -178,7 +181,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
             tensor = tensor[:, rank * local : (rank + 1) * local]
         else:
             return None
-        _assign(model, dest, tensor, static_fp8=static_fp8)
+        _assign(model, dest, tensor)
         return dest
     if kind == "linear_attn":
         dest = f"layers.{layer}.mixer.{name}"
@@ -192,7 +195,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
             tensor = _shard_out(tensor, rank, world, num_v, head_v)
         elif name != "norm.weight":
             return None
-        _assign(model, dest, tensor, static_fp8=static_fp8)
+        _assign(model, dest, tensor)
         return dest
     if kind == "self_attn":
         heads = config.num_attention_heads
@@ -218,7 +221,7 @@ def _place(model, key: str, tensor: torch.Tensor) -> str | None:
             dest = f"layers.{layer}.attn.k_norm"
         else:
             return None
-        _assign(model, dest, tensor, static_fp8=static_fp8)
+        _assign(model, dest, tensor)
         return dest
     return None
 
@@ -237,6 +240,20 @@ def load_text_weights(model, path: str | os.PathLike) -> list[str]:
     missing = [name for name, _ in model.named_parameters() if name not in loaded]
     if missing:
         raise KeyError("checkpoint did not fill: " + ", ".join(missing))
+    if getattr(model, "quantize_fp8", False):
+        fp8_bytes = 0
+        other_bytes = 0
+        for param in model.parameters():
+            nbytes = param.numel() * param.element_size()
+            if param.dtype == torch.float8_e4m3fn:
+                fp8_bytes += nbytes
+            else:
+                other_bytes += nbytes
+        print(
+            f"static FP8 weights: {fp8_bytes / (1024 ** 3):.2f} GiB fp8, "
+            f"{other_bytes / (1024 ** 3):.2f} GiB other parameters",
+            flush=True,
+        )
     return loaded
 
 

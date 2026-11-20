@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .static_fp8 import linear as _linear
+
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
@@ -191,12 +193,6 @@ class GatedRMSNorm(nn.Module):
         y = self.weight * y.to(dtype)
         y = y * F.silu(gate.float())
         return y.to(dtype)
-
-
-def _linear(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-    from .static_fp8 import linear
-
-    return linear(layer, x)
 
 
 class Qwen38GatedDeltaNet(nn.Module):

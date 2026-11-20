@@ -2022,7 +2022,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.compile_options = {"alias_meta_to_neuron": True}
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
-        hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        # Models that set skip_modular_mac_threshold put several NKI calls in
+        # one graph. The threshold splits those calls, and NRT rejects the NEFF.
+        _flag_model = getattr(self.model, "_orig_mod", self.model)
+        if getattr(_flag_model, "skip_modular_mac_threshold", False):
+            # Omitting the flag leaves the compiler default (2e11 MACs). This
+            # model's graph is above that, so it still splits, and NRT then
+            # rejects the NEFF. A threshold above the counted MACs keeps one
+            # module. Other models keep the threshold of 10, which forces a split.
+            hlo2_parts: list[str] = ["--modular-flow-mac-threshold=1000000000000000000"]
+        else:
+            hlo2_parts = ["--modular-flow-mac-threshold=10"]
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from libtorch_neuronx_lite.compile.platform import get_platform_target
@@ -2033,7 +2043,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not has_fp8:
             has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
         if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
-            hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+            hlo2_parts.append("--experimental-unsafe-fp8e4m3fn-as-fp8e4m3")
         # The native GK decode graph takes XLA's compiler inputs (NF-351). Stop hlo2penguin
         # tagging the sampling-params all-gather as FSDP; it must join this string, since a
         # second --internal-hlo2tensorizer-options replaces the first. And override the
@@ -2044,7 +2054,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             and getattr(self.model, "use_stacked_kv_cache", False)
         )
         if native_gk_decode:
-            hlo2tensorizer_opts += " --enable-annotate-fsdp-cc=false"
+            hlo2_parts.append("--enable-annotate-fsdp-cc=false")
+        hlo2tensorizer_opts = " ".join(hlo2_parts)
         # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
         # Opt-level precedence, highest first:
         #   1. Explicit --optimization-level from the caller (CLI or offline API)
@@ -2068,17 +2079,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "--auto-cast=none",
             "--verbose=35",
             f"-O{default_opt_level}",
-            f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
-            # --enable-nested-dynamic-loop: NKI kernels may contain nested
-            # dynamic loops (scf.for inside scf.for). After inline_nki_kernel
-            # inlines kernel BIR into the parent graph, birverifier rejects the
-            # resulting multiple back-edges without this flag.
-            "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
-            # 512MB scratchpad pages round each live region up and push the
-            # 1536-token prefill over the 24GB logical-core limit. 64MB pages
-            # must match NEURON_SCRATCHPAD_PAGE_SIZE at runtime.
-            "--hbm-scratchpad-page-size=64",
         ]
+        if hlo2tensorizer_opts:
+            self.compile_options["compiler_args"].append(
+                f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}"
+            )
+        # --enable-nested-dynamic-loop: NKI kernels may contain nested
+        # dynamic loops (scf.for inside scf.for). After inline_nki_kernel
+        # inlines kernel BIR into the parent graph, birverifier rejects the
+        # resulting multiple back-edges without this flag.
+        self.compile_options["compiler_args"].append(
+            "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop"
+        )
         if native_gk_decode:
             self.compile_options["compiler_args"].append("--model-type=generic")
         # An explicit caller level wins over the model default. Enable the model
